@@ -1,0 +1,113 @@
+# Workflow name
+name: Build TWRP for b4q
+
+# Workflow triggers
+on:
+  # Allows manual triggering from the GitHub Actions page
+  workflow_dispatch:
+  # Triggers automatically on pushes to the specified branch
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    # Security: Only run the job if triggered by the repository owner
+    if: github.event.repository.owner.id == github.event.sender.id
+    # Runner: Use the latest Ubuntu 24.04 environment
+    runs-on: ubuntu-24.04
+    # Permissions: Grant write permissions to create a GitHub Release
+    permissions:
+      contents: write
+
+    steps:
+    # Step 1: Check out the current repository (the device tree)
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Step 2: Maximize build space
+    # Removes pre-installed software and frees up disk space for the AOSP sync + build.
+    - name: Cleanup Build Environment
+      uses: rokibhasansagar/slimhub_actions@main
+
+    # Step 3: Install build dependencies
+    - name: Prepare Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
+
+    # Step 4: Set up Java environment (OpenJDK 11 for this Android version)
+    - name: Install OpenJDK 11
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '11'
+
+    # Step 5: Install Google's 'repo' tool
+    - name: Install repo
+      run: |
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        sudo ln -sf ~/bin/repo /usr/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
+
+    # Step 6: Initialize the TWRP 12.1 AOSP manifest
+    - name: Initialize repo
+      id: workspace
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "path=$(pwd)" >> $GITHUB_OUTPUT
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@users.noreply.github.com"
+        repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp -b twrp-12.1
+
+    # Step 7: Sync the source code (time-consuming)
+    - name: Repo Sync
+      run: |
+        repo sync -c --prune -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+      working-directory: ${{ steps.workspace.outputs.path }}
+
+    # Step 8: Place the device tree into the AOSP source
+    - name: Copy device tree
+      run: |
+        mkdir -p device/samsung/b4q
+        rsync -a --exclude='.git/' --exclude='workspace/' ${{ github.workspace }}/ device/samsung/b4q/
+      working-directory: ${{ steps.workspace.outputs.path }}
+
+    # Step 9: Increase swap space to avoid OOM during compilation
+    - name: Set Swap Space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 8
+
+    # Step 10: Compile the recovery image
+    - name: Building recovery
+      run: |
+        source build/envsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true
+        lunch twrp_b4q-eng
+        make clean
+        mka recoveryimage -j$(nproc --all)
+      working-directory: ${{ steps.workspace.outputs.path }}
+
+    # Step 11: Upload the recovery image as a workflow artifact
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: twrp-b4q-recovery
+        path: ${{ steps.workspace.outputs.path }}/out/target/product/b4q/recovery.img
+        if-no-files-found: error
+
+    # Step 12: Also create a GitHub Release with the image attached
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.workspace.outputs.path }}/out/target/product/b4q/recovery.img
+        name: "b4q-${{ github.run_id }}"
+        tag_name: ${{ github.run_id }}
+        body: "TWRP build for b4q"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
